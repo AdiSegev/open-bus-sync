@@ -20,7 +20,7 @@ const { createClient } = require('@supabase/supabase-js');
 const CONFIG = {
   API_BASE: 'https://open-bus-stride-api.hasadna.org.il',
   BATCH_SIZE: 1000,
-  API_BATCH_SIZE: 20000,
+  API_BATCH_SIZE: 5000,
   MAX_RIDES_SAMPLE: 10000,
   KEEP_DAYS: 7,
   DELAY_BETWEEN_BATCHES: 100,
@@ -64,6 +64,12 @@ function getCurrentDate() {
   return new Date().toISOString().split('T')[0];
 }
 
+function getPreviousDate(dateStr, daysAgo) {
+  const date = new Date(dateStr);
+  date.setDate(date.getDate() - daysAgo);
+  return date.toISOString().split('T')[0];
+}
+
 // בדיקת בריאות API
 async function checkAPIHealth() {
   log('🔍 בודק זמינות Open Bus API...');
@@ -101,131 +107,167 @@ async function checkAPIHealth() {
 // טעינה מ-API
 // ===============================
 
-async function loadAllStopsFromAPI(date) {
-  log('📥 טוען תחנות מ-Open Bus API...');
+async function loadStopsWithStreamingInsert(date, supabase) {
+  log('📥 טוען ומסנכרן תחנות מ-Open Bus API...');
   
-  const stops = [];
+  let totalStops = 0;
   let offset = 0;
-  let retries = 0;
-  const MAX_RETRIES = 3;
-  
-  // נסה קודם עם date, אם לא עובד - בלי date
-  let useDate = true;
+  const MAX_RETRIES = 5;
+  const BATCH_INSERT_SIZE = 1000;
   
   while (true) {
-    try {
-      const url = new URL(`${CONFIG.API_BASE}/gtfs_stops/list`);
-      if (useDate) {
+    let retries = 0;
+    let batch = null;
+    
+    // Retry loop עם exponential backoff
+    while (retries < MAX_RETRIES) {
+      try {
+        const url = new URL(`${CONFIG.API_BASE}/gtfs_stops/list`);
         url.searchParams.set('date', date);
-      }
-      url.searchParams.set('limit', CONFIG.API_BATCH_SIZE);
-      url.searchParams.set('offset', offset);
-      url.searchParams.set('get_count', 'false');
-      
-      log(`   מבקש: offset=${offset}, date=${useDate ? date : 'none'}`);
-      
-      const response = await fetch(url);
-      
-      if (!response.ok) {
-        // אם 500 והפעם הראשונה - נסה בלי date parameter
-        if (response.status === 500 && useDate && offset === 0) {
-          log('⚠️  שגיאה 500 עם date parameter, מנסה בלי date...');
-          useDate = false;
-          continue;
+        url.searchParams.set('limit', CONFIG.API_BATCH_SIZE);
+        url.searchParams.set('offset', offset);
+        url.searchParams.set('get_count', 'false');
+        
+        const response = await fetch(url);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        batch = await response.json();
+        break; // הצלחה - צא מ-retry loop
+        
+      } catch (error) {
+        retries++;
+        const waitTime = Math.min(5000 * Math.pow(2, retries - 1), 30000); // 5s, 10s, 20s, 30s
+        
+        if (retries >= MAX_RETRIES) {
+          logError(`שגיאה בטעינת תחנות אחרי ${MAX_RETRIES} ניסיונות`, error);
+          log('⚠️  ממשיך לשלב הבא...');
+          return totalStops;
+        }
+        
+        log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מחכה ${waitTime/1000}s...`);
+        await sleep(waitTime);
       }
-      
-      const batch = await response.json();
-      
-      if (!batch || batch.length === 0) break;
-      
-      stops.push(...batch);
-      log(`   נטענו ${stops.length.toLocaleString()} תחנות...`);
-      
-      if (batch.length < CONFIG.API_BATCH_SIZE) break;
-      
-      offset += CONFIG.API_BATCH_SIZE;
-      retries = 0; // איפוס ספירת retries אחרי הצלחה
-      await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
-      
-    } catch (error) {
-      retries++;
-      
-      if (retries >= MAX_RETRIES) {
-        logError('שגיאה בטעינת תחנות אחרי 3 ניסיונות', error);
-        throw error;
-      }
-      
-      log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מנסה שוב בעוד 5 שניות...`);
-      await sleep(5000);
     }
+    
+    // אם הגענו לסוף או לא קיבלנו נתונים
+    if (!batch || batch.length === 0) break;
+    
+    // הכנת נתונים להכנסה
+    const stopsData = batch.map(stop => ({
+      id: stop.id,
+      code: stop.code,
+      name: stop.name,
+      city: stop.city,
+      lat: stop.lat,
+      lon: stop.lon,
+      location: `POINT(${stop.lon} ${stop.lat})`,
+      date: date,
+      synced_at: new Date().toISOString()
+    }));
+    
+    // הכנסה מיידית ל-Supabase
+    const { error } = await supabase
+      .from('stops')
+      .upsert(stopsData, { onConflict: 'id,date' });
+    
+    if (error) {
+      logError('שגיאה בהכנסת batch של תחנות', error);
+      // ממשיך למרות שגיאה - לא קורסים
+    }
+    
+    totalStops += batch.length;
+    log(`   נשמרו ${totalStops.toLocaleString()} תחנות...`);
+    
+    if (batch.length < CONFIG.API_BATCH_SIZE) break;
+    
+    offset += CONFIG.API_BATCH_SIZE;
+    await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
   }
   
-  log(`✅ נטענו ${stops.length.toLocaleString()} תחנות`);
-  return stops;
+  log(`✅ הושלם סנכרון ${totalStops.toLocaleString()} תחנות`);
+  return totalStops;
 }
 
-async function loadAllRoutesFromAPI(date) {
-  log('📥 טוען קווים מ-Open Bus API...');
+async function loadRoutesWithStreamingInsert(date, supabase) {
+  log('📥 טוען ומסנכרן קווים מ-Open Bus API...');
   
-  const routes = [];
+  let totalRoutes = 0;
   let offset = 0;
-  let retries = 0;
-  const MAX_RETRIES = 3;
-  let useDate = true;
+  const MAX_RETRIES = 5;
   
   while (true) {
-    try {
-      const url = new URL(`${CONFIG.API_BASE}/gtfs_routes/list`);
-      if (useDate) {
+    let retries = 0;
+    let batch = null;
+    
+    while (retries < MAX_RETRIES) {
+      try {
+        const url = new URL(`${CONFIG.API_BASE}/gtfs_routes/list`);
         url.searchParams.set('date', date);
-      }
-      url.searchParams.set('limit', CONFIG.API_BATCH_SIZE);
-      url.searchParams.set('offset', offset);
-      url.searchParams.set('get_count', 'false');
-      
-      const response = await fetch(url);
-      
-      if (!response.ok) {
-        if (response.status === 500 && useDate && offset === 0) {
-          log('⚠️  שגיאה 500 עם date parameter, מנסה בלי date...');
-          useDate = false;
-          continue;
+        url.searchParams.set('limit', CONFIG.API_BATCH_SIZE);
+        url.searchParams.set('offset', offset);
+        url.searchParams.set('get_count', 'false');
+        
+        const response = await fetch(url);
+        
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
         }
         
-        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+        batch = await response.json();
+        break;
+        
+      } catch (error) {
+        retries++;
+        const waitTime = Math.min(5000 * Math.pow(2, retries - 1), 30000);
+        
+        if (retries >= MAX_RETRIES) {
+          logError(`שגיאה בטעינת קווים אחרי ${MAX_RETRIES} ניסיונות`, error);
+          log('⚠️  ממשיך לשלב הבא...');
+          return totalRoutes;
+        }
+        
+        log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מחכה ${waitTime/1000}s...`);
+        await sleep(waitTime);
       }
-      
-      const batch = await response.json();
-      
-      if (!batch || batch.length === 0) break;
-      
-      routes.push(...batch);
-      log(`   נטענו ${routes.length.toLocaleString()} קווים...`);
-      
-      if (batch.length < CONFIG.API_BATCH_SIZE) break;
-      
-      offset += CONFIG.API_BATCH_SIZE;
-      retries = 0;
-      await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
-      
-    } catch (error) {
-      retries++;
-      
-      if (retries >= MAX_RETRIES) {
-        logError('שגיאה בטעינת קווים אחרי 3 ניסיונות', error);
-        throw error;
-      }
-      
-      log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מנסה שוב בעוד 5 שניות...`);
-      await sleep(5000);
     }
+    
+    if (!batch || batch.length === 0) break;
+    
+    const routesData = batch.map(route => ({
+      id: route.id,
+      line_ref: route.line_ref,
+      operator_ref: route.operator_ref,
+      route_short_name: route.route_short_name,
+      route_long_name: route.route_long_name,
+      route_direction: route.route_direction,
+      agency_name: route.agency_name,
+      route_type: route.route_type,
+      date: date,
+      synced_at: new Date().toISOString()
+    }));
+    
+    const { error } = await supabase
+      .from('routes')
+      .upsert(routesData, { onConflict: 'id,date' });
+    
+    if (error) {
+      logError('שגיאה בהכנסת batch של קווים', error);
+    }
+    
+    totalRoutes += batch.length;
+    log(`   נשמרו ${totalRoutes.toLocaleString()} קווים...`);
+    
+    if (batch.length < CONFIG.API_BATCH_SIZE) break;
+    
+    offset += CONFIG.API_BATCH_SIZE;
+    await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
   }
   
-  log(`✅ נטענו ${routes.length.toLocaleString()} קווים`);
-  return routes;
+  log(`✅ הושלם סנכרון ${totalRoutes.toLocaleString()} קווים`);
+  return totalRoutes;
 }
 
 async function loadRidesSampleFromAPI(date, limit) {
@@ -278,81 +320,6 @@ async function loadRidesSampleFromAPI(date, limit) {
 // ===============================
 // שמירה ב-Supabase
 // ===============================
-
-async function syncStopsToSupabase(stops, date) {
-  log('💾 מסנכרן תחנות ל-Supabase...');
-  
-  const stopsData = stops.map(stop => ({
-    id: stop.id,
-    code: stop.code,
-    name: stop.name,
-    city: stop.city,
-    lat: stop.lat,
-    lon: stop.lon,
-    location: `POINT(${stop.lon} ${stop.lat})`,
-    date: date,
-    synced_at: new Date().toISOString()
-  }));
-  
-  let inserted = 0;
-  for (let i = 0; i < stopsData.length; i += CONFIG.BATCH_SIZE) {
-    const batch = stopsData.slice(i, i + CONFIG.BATCH_SIZE);
-    
-    const { error } = await supabase
-      .from('stops')
-      .upsert(batch, { onConflict: 'id,date' });
-    
-    if (error) {
-      logError(`שגיאה בהכנסת תחנות batch ${Math.floor(i / CONFIG.BATCH_SIZE) + 1}`, error);
-      throw error;
-    }
-    
-    inserted += batch.length;
-    log(`   הוכנסו ${inserted.toLocaleString()} / ${stopsData.length.toLocaleString()} תחנות`);
-    
-    await sleep(50);
-  }
-  
-  log(`✅ הושלם סנכרון ${stopsData.length.toLocaleString()} תחנות`);
-}
-
-async function syncRoutesToSupabase(routes, date) {
-  log('💾 מסנכרן קווים ל-Supabase...');
-  
-  const routesData = routes.map(route => ({
-    id: route.id,
-    line_ref: route.line_ref,
-    operator_ref: route.operator_ref,
-    route_short_name: route.route_short_name,
-    route_long_name: route.route_long_name,
-    route_direction: route.route_direction,
-    agency_name: route.agency_name,
-    route_type: route.route_type,
-    date: date,
-    synced_at: new Date().toISOString()
-  }));
-  
-  let inserted = 0;
-  for (let i = 0; i < routesData.length; i += CONFIG.BATCH_SIZE) {
-    const batch = routesData.slice(i, i + CONFIG.BATCH_SIZE);
-    
-    const { error } = await supabase
-      .from('routes')
-      .upsert(batch, { onConflict: 'id,date' });
-    
-    if (error) {
-      logError(`שגיאה בהכנסת קווים batch ${Math.floor(i / CONFIG.BATCH_SIZE) + 1}`, error);
-      throw error;
-    }
-    
-    inserted += batch.length;
-    log(`   הוכנסו ${inserted.toLocaleString()} / ${routesData.length.toLocaleString()} קווים`);
-    
-    await sleep(50);
-  }
-  
-  log(`✅ הושלם סנכרון ${routesData.length.toLocaleString()} קווים`);
-}
 
 async function syncRidesToSupabase(rides) {
   log('💾 מסנכרן נסיעות ל-Supabase...');
@@ -448,8 +415,28 @@ function isStopRelevantToCity(stop, cityName) {
   return { relevant: false };
 }
 
-async function buildCityRelevantStops(stops, date) {
+async function buildCityRelevantStops(date, supabase) {
   log('🔨 בונה טבלת city_relevant_stops...');
+  
+  // טען תחנות מה-DB
+  log('   טוען תחנות מ-Supabase...');
+  const { data: stops, error: loadError } = await supabase
+    .from('stops')
+    .select('id, name, city')
+    .eq('date', date);
+  
+  if (loadError) {
+    logError('שגיאה בטעינת תחנות מ-Supabase', loadError);
+    log('⚠️  מדלג על בניית city_relevant_stops');
+    return;
+  }
+  
+  if (!stops || stops.length === 0) {
+    log('⚠️  אין תחנות בDB, מדלג על בניית city_relevant_stops');
+    return;
+  }
+  
+  log(`   נטענו ${stops.length.toLocaleString()} תחנות מה-DB`);
   
   const cities = [...new Set(stops.map(s => s.city).filter(Boolean))];
   log(`   מצאתי ${cities.length} ערים ייחודיות`);
@@ -505,7 +492,7 @@ async function buildCityRelevantStops(stops, date) {
     
     if (error) {
       logError(`שגיאה בהכנסת קשרים batch ${Math.floor(i / CONFIG.BATCH_SIZE) + 1}`, error);
-      throw error;
+      // ממשיך למרות שגיאה
     }
     
     inserted += batch.length;
@@ -595,31 +582,40 @@ async function main() {
     
     if (!apiHealthy) {
       log('⚠️  API לא זמין, מנסה שוב בעוד דקה...');
-      await sleep(60000); // חכה דקה
+      await sleep(60000);
       
       const retryHealth = await checkAPIHealth();
       
       if (!retryHealth) {
-        throw new Error('Open Bus API לא זמין אחרי 2 ניסיונות. נסה שוב מאוחר יותר.');
+        log('❌ Open Bus API לא זמין אחרי 2 ניסיונות');
+        log('⚠️  ממשיך לשאר התהליכים...');
       }
     }
     
-    log(''); // שורה ריקה לפני התחלת הסנכרון
+    log('');
     
-    // שלב 1: תחנות
-    const stops = await loadAllStopsFromAPI(date);
-    await syncStopsToSupabase(stops, date);
+    // שלב 1: תחנות (streaming insert)
+    const stopsCount = await loadStopsWithStreamingInsert(date, supabase);
     
-    // שלב 2: קווים
-    const routes = await loadAllRoutesFromAPI(date);
-    await syncRoutesToSupabase(routes, date);
+    // שלב 2: קווים (streaming insert)
+    const routesCount = await loadRoutesWithStreamingInsert(date, supabase);
     
     // שלב 3: נסיעות (דגימה)
-    const rides = await loadRidesSampleFromAPI(date, CONFIG.MAX_RIDES_SAMPLE);
-    await syncRidesToSupabase(rides);
+    log('📥 טוען נסיעות לדוגמה...');
+    try {
+      const rides = await loadRidesSampleFromAPI(date, CONFIG.MAX_RIDES_SAMPLE);
+      await syncRidesToSupabase(rides);
+    } catch (error) {
+      logError('שגיאה בסנכרון נסיעות', error);
+      log('⚠️  ממשיך לשלב הבא...');
+    }
     
-    // שלב 4: בניית city_relevant_stops
-    await buildCityRelevantStops(stops, date);
+    // שלב 4: בניית city_relevant_stops (רק אם יש תחנות)
+    if (stopsCount > 0) {
+      await buildCityRelevantStops(date, supabase);
+    } else {
+      log('⚠️  אין תחנות, מדלג על city_relevant_stops');
+    }
     
     // שלב 5: ניקוי
     await cleanupOldData();
