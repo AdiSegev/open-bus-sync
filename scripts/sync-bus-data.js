@@ -20,7 +20,7 @@ const { createClient } = require('@supabase/supabase-js');
 const CONFIG = {
   API_BASE: 'https://open-bus-stride-api.hasadna.org.il',
   BATCH_SIZE: 1000,
-  API_BATCH_SIZE: 5000,
+  API_BATCH_SIZE: 20000,
   MAX_RIDES_SAMPLE: 10000,
   KEEP_DAYS: 7,
   DELAY_BETWEEN_BATCHES: 100,
@@ -64,6 +64,39 @@ function getCurrentDate() {
   return new Date().toISOString().split('T')[0];
 }
 
+// בדיקת בריאות API
+async function checkAPIHealth() {
+  log('🔍 בודק זמינות Open Bus API...');
+  
+  try {
+    const url = new URL(`${CONFIG.API_BASE}/gtfs_stops/list`);
+    url.searchParams.set('limit', '1');
+    
+    const response = await fetch(url, { 
+      signal: AbortSignal.timeout(10000) // 10 שניות timeout
+    });
+    
+    if (!response.ok) {
+      log(`⚠️  API מחזיר status ${response.status}`);
+      return false;
+    }
+    
+    const data = await response.json();
+    
+    if (!data || !Array.isArray(data)) {
+      log('⚠️  API מחזיר פורמט לא תקין');
+      return false;
+    }
+    
+    log('✅ API זמין ועובד תקין');
+    return true;
+    
+  } catch (error) {
+    logError('API לא זמין', error);
+    return false;
+  }
+}
+
 // ===============================
 // טעינה מ-API
 // ===============================
@@ -73,18 +106,34 @@ async function loadAllStopsFromAPI(date) {
   
   const stops = [];
   let offset = 0;
+  let retries = 0;
+  const MAX_RETRIES = 3;
+  
+  // נסה קודם עם date, אם לא עובד - בלי date
+  let useDate = true;
   
   while (true) {
     try {
       const url = new URL(`${CONFIG.API_BASE}/gtfs_stops/list`);
-      url.searchParams.set('date', date);
+      if (useDate) {
+        url.searchParams.set('date', date);
+      }
       url.searchParams.set('limit', CONFIG.API_BATCH_SIZE);
       url.searchParams.set('offset', offset);
       url.searchParams.set('get_count', 'false');
       
+      log(`   מבקש: offset=${offset}, date=${useDate ? date : 'none'}`);
+      
       const response = await fetch(url);
       
       if (!response.ok) {
+        // אם 500 והפעם הראשונה - נסה בלי date parameter
+        if (response.status === 500 && useDate && offset === 0) {
+          log('⚠️  שגיאה 500 עם date parameter, מנסה בלי date...');
+          useDate = false;
+          continue;
+        }
+        
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
       
@@ -98,11 +147,19 @@ async function loadAllStopsFromAPI(date) {
       if (batch.length < CONFIG.API_BATCH_SIZE) break;
       
       offset += CONFIG.API_BATCH_SIZE;
+      retries = 0; // איפוס ספירת retries אחרי הצלחה
       await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
       
     } catch (error) {
-      logError('שגיאה בטעינת תחנות', error);
-      throw error;
+      retries++;
+      
+      if (retries >= MAX_RETRIES) {
+        logError('שגיאה בטעינת תחנות אחרי 3 ניסיונות', error);
+        throw error;
+      }
+      
+      log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מנסה שוב בעוד 5 שניות...`);
+      await sleep(5000);
     }
   }
   
@@ -115,11 +172,16 @@ async function loadAllRoutesFromAPI(date) {
   
   const routes = [];
   let offset = 0;
+  let retries = 0;
+  const MAX_RETRIES = 3;
+  let useDate = true;
   
   while (true) {
     try {
       const url = new URL(`${CONFIG.API_BASE}/gtfs_routes/list`);
-      url.searchParams.set('date', date);
+      if (useDate) {
+        url.searchParams.set('date', date);
+      }
       url.searchParams.set('limit', CONFIG.API_BATCH_SIZE);
       url.searchParams.set('offset', offset);
       url.searchParams.set('get_count', 'false');
@@ -127,6 +189,12 @@ async function loadAllRoutesFromAPI(date) {
       const response = await fetch(url);
       
       if (!response.ok) {
+        if (response.status === 500 && useDate && offset === 0) {
+          log('⚠️  שגיאה 500 עם date parameter, מנסה בלי date...');
+          useDate = false;
+          continue;
+        }
+        
         throw new Error(`HTTP ${response.status}: ${response.statusText}`);
       }
       
@@ -140,11 +208,19 @@ async function loadAllRoutesFromAPI(date) {
       if (batch.length < CONFIG.API_BATCH_SIZE) break;
       
       offset += CONFIG.API_BATCH_SIZE;
+      retries = 0;
       await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
       
     } catch (error) {
-      logError('שגיאה בטעינת קווים', error);
-      throw error;
+      retries++;
+      
+      if (retries >= MAX_RETRIES) {
+        logError('שגיאה בטעינת קווים אחרי 3 ניסיונות', error);
+        throw error;
+      }
+      
+      log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מנסה שוב בעוד 5 שניות...`);
+      await sleep(5000);
     }
   }
   
@@ -514,6 +590,22 @@ async function main() {
   log(`📅 תאריך: ${date}\n`);
   
   try {
+    // בדיקת בריאות API
+    const apiHealthy = await checkAPIHealth();
+    
+    if (!apiHealthy) {
+      log('⚠️  API לא זמין, מנסה שוב בעוד דקה...');
+      await sleep(60000); // חכה דקה
+      
+      const retryHealth = await checkAPIHealth();
+      
+      if (!retryHealth) {
+        throw new Error('Open Bus API לא זמין אחרי 2 ניסיונות. נסה שוב מאוחר יותר.');
+      }
+    }
+    
+    log(''); // שורה ריקה לפני התחלת הסנכרון
+    
     // שלב 1: תחנות
     const stops = await loadAllStopsFromAPI(date);
     await syncStopsToSupabase(stops, date);
