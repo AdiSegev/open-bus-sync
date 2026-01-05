@@ -20,7 +20,7 @@ const { createClient } = require('@supabase/supabase-js');
 const CONFIG = {
   API_BASE: 'https://open-bus-stride-api.hasadna.org.il',
   BATCH_SIZE: 1000,
-  API_BATCH_SIZE: 5000,
+  API_BATCH_SIZE: 20000,
   MAX_RIDES_SAMPLE: 10000,
   KEEP_DAYS: 7,
   DELAY_BETWEEN_BATCHES: 100,
