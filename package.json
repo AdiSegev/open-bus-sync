@@ -1,0 +1,24 @@
+{
+  "name": "open-bus-supabase-sync",
+  "version": "1.0.0",
+  "description": "Daily sync from Open Bus Stride API to Supabase",
+  "main": "scripts/sync-bus-data.js",
+  "scripts": {
+    "sync": "node scripts/sync-bus-data.js",
+    "test": "node scripts/sync-bus-data.js"
+  },
+  "keywords": [
+    "open-bus",
+    "supabase",
+    "gtfs",
+    "transit"
+  ],
+  "author": "",
+  "license": "MIT",
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
