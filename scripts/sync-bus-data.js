@@ -20,7 +20,7 @@ const { createClient } = require('@supabase/supabase-js');
 const CONFIG = {
   API_BASE: 'https://open-bus-stride-api.hasadna.org.il',
   BATCH_SIZE: 1000,
-  API_BATCH_SIZE: 20000,
+  API_BATCH_SIZE: 5000,
   MAX_RIDES_SAMPLE: 10000,
   KEEP_DAYS: 7,
   DELAY_BETWEEN_BATCHES: 100,
@@ -111,9 +111,10 @@ async function loadStopsWithStreamingInsert(date, supabase) {
   log('📥 טוען ומסנכרן תחנות מ-Open Bus API...');
   
   let totalStops = 0;
+  let totalUnique = 0;
   let offset = 0;
   const MAX_RETRIES = 5;
-  const BATCH_INSERT_SIZE = 1000;
+  const seenStops = new Map(); // key: "code_city", value: stop data
   
   while (true) {
     let retries = 0;
@@ -144,7 +145,7 @@ async function loadStopsWithStreamingInsert(date, supabase) {
         if (retries >= MAX_RETRIES) {
           logError(`שגיאה בטעינת תחנות אחרי ${MAX_RETRIES} ניסיונות`, error);
           log('⚠️  ממשיך לשלב הבא...');
-          return totalStops;
+          return totalUnique;
         }
         
         log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מחכה ${waitTime/1000}s...`);
@@ -155,31 +156,46 @@ async function loadStopsWithStreamingInsert(date, supabase) {
     // אם הגענו לסוף או לא קיבלנו נתונים
     if (!batch || batch.length === 0) break;
     
-    // הכנת נתונים להכנסה
-    const stopsData = batch.map(stop => ({
-      id: stop.id,
-      code: stop.code,
-      name: stop.name,
-      city: stop.city,
-      lat: stop.lat,
-      lon: stop.lon,
-      location: `POINT(${stop.lon} ${stop.lat})`,
-      date: date,
-      synced_at: new Date().toISOString()
-    }));
-    
-    // הכנסה מיידית ל-Supabase
-    const { error } = await supabase
-      .from('stops')
-      .upsert(stopsData, { onConflict: 'id,date' });
-    
-    if (error) {
-      logError('שגיאה בהכנסת batch של תחנות', error);
-      // ממשיך למרות שגיאה - לא קורסים
+    // Deduplication: שמור רק תחנה אחת לכל (code, city)
+    for (const stop of batch) {
+      const key = `${stop.code}_${stop.city || 'NULL'}`;
+      if (!seenStops.has(key)) {
+        seenStops.set(key, stop);
+      }
     }
     
     totalStops += batch.length;
-    log(`   נשמרו ${totalStops.toLocaleString()} תחנות...`);
+    
+    // כל 10K רשומות מה-API - שמור את הייחודיות
+    if (offset > 0 && offset % 10000 === 0) {
+      const uniqueStops = Array.from(seenStops.values());
+      
+      if (uniqueStops.length > 0) {
+        const stopsData = uniqueStops.map(stop => ({
+          code: stop.code,
+          city: stop.city,
+          name: stop.name,
+          lat: stop.lat,
+          lon: stop.lon,
+          location: `POINT(${stop.lon} ${stop.lat})`,
+          date: date,
+          synced_at: new Date().toISOString()
+        }));
+        
+        const { error } = await supabase
+          .from('stops')
+          .upsert(stopsData, { onConflict: 'code,city,date' });
+        
+        if (error) {
+          logError('שגיאה בהכנסת batch של תחנות', error);
+        }
+        
+        totalUnique += uniqueStops.length;
+        log(`   נשמרו ${totalUnique.toLocaleString()} תחנות ייחודיות (מתוך ${totalStops.toLocaleString()})...`);
+        
+        seenStops.clear(); // נקה זיכרון
+      }
+    }
     
     if (batch.length < CONFIG.API_BATCH_SIZE) break;
     
@@ -187,8 +203,34 @@ async function loadStopsWithStreamingInsert(date, supabase) {
     await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
   }
   
-  log(`✅ הושלם סנכרון ${totalStops.toLocaleString()} תחנות`);
-  return totalStops;
+  // שמור את השארית
+  const uniqueStops = Array.from(seenStops.values());
+  
+  if (uniqueStops.length > 0) {
+    const stopsData = uniqueStops.map(stop => ({
+      code: stop.code,
+      city: stop.city,
+      name: stop.name,
+      lat: stop.lat,
+      lon: stop.lon,
+      location: `POINT(${stop.lon} ${stop.lat})`,
+      date: date,
+      synced_at: new Date().toISOString()
+    }));
+    
+    const { error } = await supabase
+      .from('stops')
+      .upsert(stopsData, { onConflict: 'code,city,date' });
+    
+    if (error) {
+      logError('שגיאה בהכנסת batch אחרון של תחנות', error);
+    }
+    
+    totalUnique += uniqueStops.length;
+  }
+  
+  log(`✅ הושלם סנכרון ${totalUnique.toLocaleString()} תחנות ייחודיות (סונן ${(totalStops - totalUnique).toLocaleString()} כפילויות)`);
+  return totalUnique;
 }
 
 async function loadRoutesWithStreamingInsert(date, supabase) {
@@ -422,7 +464,7 @@ async function buildCityRelevantStops(date, supabase) {
   log('   טוען תחנות מ-Supabase...');
   const { data: stops, error: loadError } = await supabase
     .from('stops')
-    .select('id, name, city')
+    .select('code, city, name')
     .eq('date', date);
   
   if (loadError) {
@@ -457,7 +499,8 @@ async function buildCityRelevantStops(date, supabase) {
       if (relevance.relevant) {
         relations.push({
           city: city,
-          stop_id: stop.id,
+          stop_code: stop.code,
+          stop_city: stop.city,
           relevance_type: relevance.type,
           confidence: relevance.confidence,
           matched_text: relevance.matched_variant || null,
