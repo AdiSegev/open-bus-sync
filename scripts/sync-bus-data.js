@@ -173,7 +173,7 @@ async function loadStopsWithStreamingInsert(date, supabase) {
       if (uniqueStops.length > 0) {
         const stopsData = uniqueStops.map(stop => ({
           code: stop.code,
-          city: stop.city,
+          city: stop.city || 'לא ידוע',
           name: stop.name,
           lat: stop.lat,
           lon: stop.lon,
@@ -209,7 +209,7 @@ async function loadStopsWithStreamingInsert(date, supabase) {
   if (uniqueStops.length > 0) {
     const stopsData = uniqueStops.map(stop => ({
       code: stop.code,
-      city: stop.city,
+      city: stop.city || 'לא ידוע',
       name: stop.name,
       lat: stop.lat,
       lon: stop.lon,
