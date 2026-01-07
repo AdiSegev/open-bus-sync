@@ -165,64 +165,6 @@ async function loadAllRoutesFromAPI(date) {
   return routes;
 }
 
-async function loadAllRidesFromAPI(date) {
-  log('📥 טוען נסיעות (rides) מ-Open Bus API...');
-  
-  const rides = [];
-  let offset = 0;
-  const MAX_RETRIES = 5;
-  
-  while (true) {
-    let retries = 0;
-    let batch = null;
-    
-    while (retries < MAX_RETRIES) {
-      try {
-        const url = new URL(`${CONFIG.API_BASE}/gtfs_ride/list`);
-        url.searchParams.set('gtfs_route__date', date);
-        url.searchParams.set('limit', CONFIG.API_BATCH_SIZE);
-        url.searchParams.set('offset', offset);
-        url.searchParams.set('get_count', 'false');
-        
-        const response = await fetch(url);
-        
-        if (!response.ok) {
-          throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-        }
-        
-        batch = await response.json();
-        break;
-        
-      } catch (error) {
-        retries++;
-        const waitTime = Math.min(5000 * Math.pow(2, retries - 1), 30000);
-        
-        if (retries >= MAX_RETRIES) {
-          logError(`שגיאה בטעינת נסיעות אחרי ${MAX_RETRIES} ניסיונות`, error);
-          log('⚠️  ממשיך לשלב הבא...');
-          return rides;
-        }
-        
-        log(`⚠️  ניסיון ${retries}/${MAX_RETRIES} נכשל, מחכה ${waitTime/1000}s...`);
-        await sleep(waitTime);
-      }
-    }
-    
-    if (!batch || batch.length === 0) break;
-    
-    rides.push(...batch);
-    log(`   נטענו ${rides.length.toLocaleString()} נסיעות...`);
-    
-    if (batch.length < CONFIG.API_BATCH_SIZE) break;
-    
-    offset += CONFIG.API_BATCH_SIZE;
-    await sleep(CONFIG.DELAY_BETWEEN_BATCHES);
-  }
-  
-  log(`✅ נטענו ${rides.length.toLocaleString()} נסיעות`);
-  return rides;
-}
-
 // ===============================
 // שמירה ב-Supabase
 // ===============================
@@ -295,39 +237,6 @@ async function syncRoutesToSupabase(routes) {
   }
   
   log(`✅ הושלם סנכרון ${routesData.length.toLocaleString()} קווים`);
-}
-
-async function syncRidesToSupabase(rides) {
-  log('💾 מסנכרן נסיעות ל-Supabase...');
-  
-  const ridesData = rides.map(ride => ({
-    id: ride.id,
-    route_id: ride.gtfs_route_id,
-    journey_ref: ride.journey_ref,
-    start_time: ride.start_time,
-    end_time: ride.end_time
-  }));
-  
-  let inserted = 0;
-  for (let i = 0; i < ridesData.length; i += CONFIG.BATCH_SIZE) {
-    const batch = ridesData.slice(i, i + CONFIG.BATCH_SIZE);
-    
-    const { error } = await supabase
-      .from('rides')
-      .insert(batch);
-    
-    if (error) {
-      logError(`שגיאה בהכנסת נסיעות batch ${Math.floor(i / CONFIG.BATCH_SIZE) + 1}`, error);
-      throw error;
-    }
-    
-    inserted += batch.length;
-    log(`   הוכנסו ${inserted.toLocaleString()} / ${ridesData.length.toLocaleString()} נסיעות`);
-    
-    await sleep(50);
-  }
-  
-  log(`✅ הושלם סנכרון ${ridesData.length.toLocaleString()} נסיעות`);
 }
 
 // ===============================
@@ -435,7 +344,7 @@ async function buildCityRelevantStops() {
 async function showStats() {
   log('📊 סטטיסטיקות:');
   
-  const tables = ['stops', 'routes', 'rides', 'city_relevant_stops'];
+  const tables = ['stops', 'routes', 'city_relevant_stops'];
   
   for (const table of tables) {
     const { count, error } = await supabase
@@ -446,6 +355,8 @@ async function showStats() {
       log(`   ${table}: ${(count || 0).toLocaleString()}`);
     }
   }
+  
+  log(`\n💡 ride_stops נשלפים מ-API בזמן אמת`);
 }
 
 // ===============================
@@ -455,7 +366,7 @@ async function showStats() {
 async function truncateAllTables() {
   log('🗑️  מנקה טבלאות ישנות...');
   
-  const tables = ['city_relevant_stops', 'rides', 'stops', 'routes'];
+  const tables = ['city_relevant_stops', 'stops', 'routes'];
   
   for (const table of tables) {
     const { error } = await supabase.rpc('truncate_table', { 
@@ -488,7 +399,7 @@ async function main() {
   const startTime = Date.now();
   
   log('╔══════════════════════════════════════════════════════════╗');
-  log('║  Open Bus → Supabase - Daily Sync (Simple)              ║');
+  log('║  Open Bus → Supabase - Daily Sync (API-First)           ║');
   log('╚══════════════════════════════════════════════════════════╝\n');
   
   const date = getCurrentDate();
@@ -513,24 +424,18 @@ async function main() {
     }
     log('');
     
-    // שלב 4: נסיעות (rides)
-    const rides = await loadAllRidesFromAPI(date);
-    if (rides.length > 0) {
-      await syncRidesToSupabase(rides);
-    }
-    log('');
-    
-    // שלב 5: city_relevant_stops
+    // שלב 4: city_relevant_stops
     if (stops.length > 0) {
       await buildCityRelevantStops();
     }
     log('');
     
-    // שלב 6: סטטיסטיקות
+    // שלב 5: סטטיסטיקות
     await showStats();
     
     const duration = ((Date.now() - startTime) / 1000).toFixed(2);
     log(`\n✅ סנכרון יומי הושלם! (${duration} שניות)`);
+    log(`\n💡 הערה: ride_stops נשלפים ישירות מה-API בזמן אמת`);
     
     process.exit(0);
     
